@@ -1,4 +1,12 @@
-"""Tests based on the IOOS QARTOD manuals."""
+#!/usr/bin/env python
+# coding=utf-8
+"""Tests based on the IOOS QARTOD manuals.
+Modified by lnazzaro 10/2021:
+    - addition of pressure test
+    - modifications to flat line test
+        - require at least 3 non-NA data points within time window in order to flag
+        - if not enough data to evaluate, default to 'not evaluated' instead of 'pass'.
+"""
 
 from __future__ import annotations
 
@@ -248,6 +256,99 @@ def gross_range_test(
     # Flag suspect outside of sensor span
     with np.errstate(invalid="ignore"):
         flag_arr[(inp < sspan.minv) | (inp > sspan.maxv)] = QartodFlags.FAIL
+
+    return flag_arr.reshape(original_shape)
+
+
+@add_flag_metadata(standard_name='pressure_test_quality_flag',
+                   long_name='Pressure Test Quality Flag')
+def pressure_test(inp: Sequence[N],
+                   tinp: Sequence[N],
+                   suspect_threshold: N = 0,
+                   fail_threshold: N = None,
+                   profile_direction: str = 'unknown'
+                   ) -> np.ma.MaskedArray:
+    """Checks the first order difference of a series of pressure values to see
+    if there are any values in opposite direction from profile.
+    Threshold is expressed as a rate in observations units per second.
+    Missing and masked data is flagged as UNKNOWN.
+
+    Args:
+        inp: Input data as a numeric numpy array or a list of numbers.
+        tinp: Time data as a sequence of datetime objects compatible with pandas DatetimeIndex.
+              This includes numpy datetime64, python datetime objects and pandas Timestamp object.
+              ie. pd.DatetimeIndex([datetime.utcnow(), np.datetime64(), pd.Timestamp.now()]
+              If anything else is passed in the format is assumed to be seconds since the unix epoch.
+        suspect_threshold: The SUSPECT threshold value, in observations units. Pressure changes exceeding
+              this value in the direction opposite profile_direction will be flagged as SUSPECT.
+        fail_threshold: The FAIL threshold value, in observations units. Pressure changes exceeding
+              this value in the direction opposite profile_direction will be flagged as FAIL.
+        profile_direction: String defining vertical direction of the profile.
+              'up' or 'u' (pressure decreases with time)
+              'down' or 'd' (pressure increases with time)
+              'unknown' (profile direction will be calculated)
+
+    Returns:
+        A masked array of flag values equal in size to that of the input.
+    """
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        inp = np.ma.masked_invalid(np.array(inp).astype(np.float64))
+
+    # Save original shape
+    original_shape = inp.shape
+    inp = inp.flatten()
+
+    # Start with everything as passing (1)
+    flag_arr = np.ma.ones(inp.size, dtype='uint8')
+
+    # calculate rate of change in units/second
+    dPdt = np.ma.zeros(inp.size, dtype='float')
+
+    tinp = mapdates(tinp).flatten()
+    dPdt[1:] = np.diff(inp) / np.diff(tinp).astype('timedelta64[s]').astype(float)
+
+    # Apply different method
+    if profile_direction in ['up','u']:
+        profile_direction = 'up'
+    elif profile_direction in ['down','d']:
+        profile_direction = 'down'
+    elif profile_direction == 'unknown':
+        if np.sum(dPdt > 0) >= 0.75 * len(dPdt):
+            profile_direction = 'down'
+        elif np.sum(dPdt < 0) >= 0.75 * len(dPdt):
+            profile_direction = 'up'
+        else:
+            flag_arr[:] = QartodFlags.UNKNOWN
+            print('WARNING: Profile direction not consistent enough to be clearly identified as either up or down.')
+    else:
+        raise ValueError(
+            'Unknown profile_direction: "{0}", only "up or u" and "down or d" methods, or "unknown" to calculate based on given data, are available'
+            .format(profile_direction)
+        )
+
+    if profile_direction == 'up':
+        dPdt = -dPdt
+
+    # If n-1 - ref is greater than the low threshold, SUSPECT test
+    if suspect_threshold is not None:
+        with np.errstate(invalid='ignore'):
+            suspect_threshold = -np.abs(suspect_threshold)
+            flag_arr[dPdt < suspect_threshold] = QartodFlags.SUSPECT
+
+    # If n-1 - ref is greater than the high threshold, FAIL test
+    if fail_threshold is not None:
+        with np.errstate(invalid='ignore'):
+            fail_threshold = -np.abs(fail_threshold)
+            flag_arr[dPdt < fail_threshold] = QartodFlags.FAIL
+
+    # test is undefined for first and last values
+    flag_arr[0] = QartodFlags.UNKNOWN
+    flag_arr[-1] = QartodFlags.UNKNOWN
+
+    # If the value is masked or nan set the flag to MISSING
+    flag_arr[dPdt.mask] = QartodFlags.MISSING
 
     return flag_arr.reshape(original_shape)
 
@@ -742,9 +843,10 @@ def flat_line_test(
     flag_arr = np.full((inp.size,), QartodFlags.GOOD)
 
     # if we have fewer than 3 points, we can't run the test, so everything passes
-    min_inp_size = 3
-    if len(inp) < min_inp_size:
-        return flag_arr.reshape(original_shape)
+    # lnazzaro: unnecessary with addition of 3-data-point requirement within each window
+    # min_inp_size = 3
+    # if len(inp) < min_inp_size:
+    #     return flag_arr.reshape(original_shape)
 
     # determine median time interval
     tinp = mapdates(tinp).flatten()
@@ -770,13 +872,36 @@ def flat_line_test(
         data_min = np.min(window, 1)
         data_max = np.max(window, 1)
         data_range = np.abs(data_max - data_min)
+        data_count = np.ma.count(window, 1)
 
-        # find data ranges that are within threshold and flag them
-        test_results = np.ma.filled(data_range < tolerance, fill_value=False)
+        ##### edited by lnazzaro
+        # # find data ranges that are within threshold and flag them
+        #  test_results = np.ma.filled(data_range < tolerance, fill_value=False)
+        # # data points before end of first window should pass
+        # n_fill = min(len(inp), count)
+        # test_results = np.insert(test_results, 0, np.full((n_fill,), fill_value=False))
+        # flag_arr[test_results] = flag_value
+        
+        # find data ranges that are within threshold AND have high enough data count and flag them
+        test_results = np.ma.filled(np.logical_and(data_range < tolerance, data_count > 2), fill_value=False)
         # data points before end of first window should pass
-        n_fill = min(len(inp), count)
-        test_results = np.insert(test_results, 0, np.full((n_fill,), fill_value=False))
+        n_fill = count if count < len(inp) else len(inp)
+        test_results = np.insert(test_results, 0, np.full((n_fill,), False))
         flag_arr[test_results] = flag_value
+        # if data ranges are within threshold and DO NOT have high enough data count, flag as unknown
+        test_results = np.ma.filled(np.logical_and(data_range < tolerance, data_count <= 2), fill_value=False)
+        test_results = np.insert(test_results, 0, np.full((n_fill,), False))
+        # we disagree that data points before end of first window should pass
+        # loop through beginning window points and flag as not evaluated until (if) threshold is exceeded
+        for ni in np.arange(n_fill):
+            if np.isnan(inp[ni]):
+                continue
+            if np.logical_and(np.nanmax(inp[:ni+1]) - np.nanmin(inp[:ni+1]) < tolerance, flag_arr[ni]==QartodFlags.GOOD):
+                test_results[ni] = True
+            else:
+                break
+        flag_arr[test_results] = QartodFlags.UNKNOWN
+        #### end of edits by lnazzaro
 
     run_test(suspect_threshold, QartodFlags.SUSPECT)
     run_test(fail_threshold, QartodFlags.FAIL)
