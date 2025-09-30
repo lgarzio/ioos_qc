@@ -685,6 +685,7 @@ def spike_test(
         # Find the minimum variation prior and after the n value
         diff = np.ma.zeros(inp.size, dtype=np.float64)
         diff[1:-1] = np.minimum(np.abs(ref[:-1]), np.abs(ref[1:]))
+        diff = np.ma.masked_invalid(diff)  # added by Lori 9/29/2025
 
         # Make sure that only the record (n) where the difference prior and after are opposite are considered
         with np.errstate(invalid="ignore"):
